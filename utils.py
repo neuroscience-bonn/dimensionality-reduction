@@ -4,6 +4,7 @@ import numpy.typing as npt
 import torch.nn as nn
 import numpy as np
 from cebra.data import SingleSessionDataset
+from cebra.data.datatypes import Offset
 import warnings
 
 # Function to calculate the memory required by the model parameters
@@ -114,3 +115,98 @@ class TensorDataset(SingleSessionDataset):
     def __getitem__(self, index):
         index = self.expand_index(index)
         return self.neural[index].transpose(2, 1)
+
+class SimpleTensorDataset(torch.utils.data.Dataset):
+    def __init__(self, data: torch.Tensor, labels: torch.Tensor = None, offset: Offset = Offset(1), device: torch.device = torch.device("cpu")):
+        self.offset = offset
+        self.device = device
+        self.data = data.to(self.device)
+        self.labels = labels.to(self.device) if labels is not None else None
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        left, right = self.offset.left, self.offset.right
+        start = max(0, index - left)
+        end = min(len(self.data), index + right)
+        sequence = self.data[start:end]
+
+        # Pad with zeros if necessary
+        if start == 0:
+            pad_left = left - index
+            sequence = torch.cat([torch.zeros(pad_left, *self.data.shape[1:]), sequence], dim=0)
+        if end == len(self.data):
+            pad_right = (index + right) - len(self.data)
+            sequence = torch.cat([sequence, torch.zeros(pad_right, *self.data.shape[1:])], dim=0)
+
+        # Labels to go along with data if any
+        with self.device:
+            if self.labels is None:
+                return sequence.T
+            else:
+                return sequence.T, self.labels[index].unsqueeze(0)
+
+class SupervisedNNSolver:
+    """Supervised neural network training"""
+
+    def __init__(self,
+                    model: nn.Module,
+                    optimizer: torch.optim.Optimizer,
+                    criterion: nn.Module):
+            self.model = model
+            self.optimizer = optimizer
+            self.criterion = criterion
+            self.history = []
+
+    def fit(self,
+            loader: torch.utils.data.DataLoader,
+            num_steps: int):
+        """Train model for the specified number of steps.
+
+        Args:
+            loader: Data loader, which is an iterator over `cebra.data.Batch` instances.
+                Each batch contains reference, positive and negative input samples.
+        """
+
+        self.model.train()
+        step_idx = 0
+        while True:
+            for _, batch in enumerate(loader):
+                self.step(batch)
+                step_idx += 1
+                if step_idx >= num_steps:
+                    return
+
+    def step(self, batch) -> dict:
+        """Perform a single gradient update.
+
+        Args:
+            batch: The input samples in the form X, y.
+
+        Returns:
+            Dictionary containing loss.
+        """
+        self.optimizer.zero_grad()
+        X, y = batch
+        prediction = self._inference(X)
+        loss = self.criterion(prediction, y)
+        loss.backward()
+        self.optimizer.step()
+        self.history.append(loss.item())
+        return dict(total=loss.item())
+
+    def _inference(self, X):
+        """Compute predictions for the batch."""
+        prediction = self.model(X)
+        return prediction
+    
+    def validation(self, valid_loader):
+        self.model.eval()
+        with torch.no_grad():
+            for _, batch in enumerate(valid_loader):
+                X, y = batch
+                prediction = self._inference(X)
+                loss = self.criterion(prediction, y)
+                self.history.append(loss.item())
+        return dict(total=loss.item())
